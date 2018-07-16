@@ -12,28 +12,34 @@ public enum AITriggerEventType { Enter, Stay, Exit};
 public struct AITarget
 {
     //TODO make private and apply setters and getters
-    public AITargetType type { get; private set; }
-    public Collider     collider { get; private set; }
-    public Vector3      position { get; private set; }      // current position in the world
-    public float        distance { get; set; }      // distance from player
-    public float        time { get; private set; }          // tie since the target was last ping'd
+    private AITargetType _type;
+    private Collider _collider;
+    private Vector3 _position;
+    private float _distance;
+    private float _time;
+
+    public AITargetType type { get { return _type; } }
+    public Collider     collider { get { return _collider; } }
+    public Vector3      position { get { return _position; } }      
+    public float        distance { get { return _distance; } set { _distance = value; } }      
+    public float        time { get { return _time; } }     
 
     public void Set(AITargetType t, Collider c, Vector3 p, float d)
     {
-        type = t;
-        collider = c;
-        position = p;
-        distance = d;
-        time = Time.time;
+        _type = t;
+        _collider = c;
+        _position = p;
+        _distance = d;
+        _time = Time.time;
     }
 
     public void Clear()
     {
-        type = AITargetType.None;
-        collider = null;
-        position = Vector3.zero;
-        distance = Mathf.Infinity;
-        time = 0.0f;
+        _type = AITargetType.None;
+        _collider = null;
+        _position = Vector3.zero;
+        _distance = Mathf.Infinity;
+        _time = 0.0f;
     }
 }
 
@@ -47,6 +53,9 @@ public abstract class AIStateMachine : MonoBehaviour
     protected AIState _currentState = null;
     protected Dictionary<AIStateType, AIState> _states = new Dictionary<AIStateType, AIState>();
     protected AITarget _target = new AITarget();
+    protected int _rootPositionRefCount = 0;
+    protected int _rootRotationRefCount = 0;
+
 
     [SerializeField] protected AIStateType _currentStateType = AIStateType.Idle;
     [SerializeField] protected SphereCollider _targetTrigger = null;
@@ -60,20 +69,71 @@ public abstract class AIStateMachine : MonoBehaviour
     protected Collider _collider = null;
     protected Transform _transform = null;
 
+
     // Public properties
     public Animator Animator { get { return _animator; } }
     public NavMeshAgent NavAgent { get { return _navAgent; } }
+    public Vector3 sensorPosition
+    {
+        get
+        {
+            if(_sensorTrigger == null) { return Vector3.zero; }
+            Vector3 point = _sensorTrigger.transform.position;
+            point.x += _sensorTrigger.center.x * _sensorTrigger.transform.lossyScale.x;
+            point.y += _sensorTrigger.center.y * _sensorTrigger.transform.lossyScale.y;
+            point.z += _sensorTrigger.center.z * _sensorTrigger.transform.lossyScale.z;
+            return point;
+        }
+    }
+    public bool useRootPositon { get { return _rootPositionRefCount > 0; } }
+    public bool useRootRotation { get { return _rootRotationRefCount > 0; } }
+
+    public float sensorRadius
+    {
+        get
+        {
+            if (_sensorTrigger == null) { return 0.0f; }
+            float radius = Mathf.Max(_sensorTrigger.radius * _sensorTrigger.transform.lossyScale.x,
+                                     _sensorTrigger.radius * _sensorTrigger.transform.lossyScale.y);
+
+            return Mathf.Max(radius, _sensorTrigger.radius * _sensorTrigger.transform.lossyScale.z);
+        }
+    }
 
     protected virtual void Awake()
     {
+        // cache all components
         _animator = GetComponent<Animator>();
         _navAgent = GetComponent<NavMeshAgent>();
         _collider = GetComponent<Collider>();
         _transform = transform;
+
+        if(GameSceneManager.instance != null)
+        {
+            // Register State machines with scene database
+            if(_collider)
+            {
+                GameSceneManager.instance.RegisterAIStateMachine(_collider.GetInstanceID(), this);   
+            }
+            if(_sensorTrigger)
+            {
+                GameSceneManager.instance.RegisterAIStateMachine(_sensorTrigger.GetInstanceID(), this);
+            }
+        }
     }
 
     protected virtual void Start()
     {
+        if(_sensorTrigger != null)
+        {
+            AISensor script = _sensorTrigger.GetComponent<AISensor>();
+            if(script != null)
+            {
+                script.parentStateMachine = this;
+            }
+        }
+
+        // Fetch all states on this game object
         AIState[] states = GetComponents<AIState>();
         foreach (AIState state in states)
         {
@@ -182,5 +242,77 @@ public abstract class AIStateMachine : MonoBehaviour
         {
             _targetTrigger.enabled = false;
         }
+    }
+
+    protected virtual void OnTriggerEnter(Collider other)
+    {
+        if (_targetTrigger == null || other != _targetTrigger) { return; }
+
+        // Notify child state
+        if(_currentState)
+        {
+            _currentState.OnDestinationReached(true);
+        }
+    }
+
+    public virtual void OnTriggerExit(Collider other)
+    {
+        if (_targetTrigger == null || other != _targetTrigger) { return; }
+
+        // Notify child state
+        if (_currentState)
+        {
+            _currentState.OnDestinationReached(false);
+        }
+    }
+
+    /// <summary>
+    /// This method is gonna be called by the Sensor Trigger 
+    /// </summary>
+    /// <param name="type"></param>
+    /// <param name="other"></param>
+    public virtual void OnTriggerEvent(AITriggerEventType type, Collider other)
+    {
+        if(_currentState)
+        {
+            _currentState.OnTriggerEvent(type, other);
+        }
+    }
+
+    protected virtual void OnAnimatorMove()
+    {
+        if(_currentState)
+        {
+            _currentState.OnAnimatorUpdated();
+        }
+    }
+
+    protected virtual void OnAnimatorIK(int layerIndex)
+    {
+        if(_currentState)
+        {
+            _currentState.OnAnimatorIKUpdated();
+        }
+    }
+
+    public void NavAgentControl (bool positionUpdate, bool rotationUpdate)
+    {
+        if(_navAgent)
+        {
+            _navAgent.updatePosition = positionUpdate;
+            _navAgent.updateRotation = rotationUpdate;
+        }
+    }
+
+    /// <summary>
+    /// Called by the state machine behaviours to enable/disable root motion
+    /// </summary>
+    /// <param name="rootPosition"></param>
+    /// <param name="rootRotation"></param>
+
+    public void AddRootMotionRequest(int rootPosition, int rootRotation)
+    {
+        _rootPositionRefCount += rootPosition;
+        _rootRotationRefCount += rootRotation;
     }
 }
